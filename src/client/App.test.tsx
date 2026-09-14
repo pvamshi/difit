@@ -695,7 +695,7 @@ describe('App Component - Diff Mode Persistence', () => {
     expect(window.localStorage.getItem('difit.diffViewMode')).toBe('unified');
   });
 
-  it('keeps the selected view mode after triggering refresh', async () => {
+  it('refreshes automatically on repository changes and keeps the selected view mode', async () => {
     const mockGlobalFetch = vi.mocked(global.fetch);
     mockGlobalFetch.mockClear();
     mockComments = [];
@@ -714,12 +714,16 @@ describe('App Component - Diff Mode Persistence', () => {
       expect(unifiedButton).toHaveClass('bg-github-bg-primary');
     });
 
-    const refreshButton = await screen.findByRole('button', { name: 'Refresh' });
-    fireEvent.click(refreshButton);
-
+    // The watcher change is applied without a manual refresh: the diff and the
+    // repository state are refetched in place.
+    const requestedUrls = () => mockGlobalFetch.mock.calls.map((call) => String(call[0]));
     await waitFor(() => {
-      // 4 calls: initial /api/diff, /api/revisions, initial /api/comments sync, and refresh /api/diff
-      expect(mockGlobalFetch).toHaveBeenCalledTimes(4);
+      expect(requestedUrls().filter((url) => url.startsWith('/api/diff')).length).toBeGreaterThan(
+        1,
+      );
+    });
+    await waitFor(() => {
+      expect(requestedUrls().some((url) => url.startsWith('/api/repo-state'))).toBe(true);
     });
 
     await waitFor(() => {
@@ -1044,6 +1048,110 @@ describe('App Component - Sidebar persistence', () => {
     fireEvent.click(toggleButton);
     await waitFor(() => {
       expect(window.localStorage.getItem('difit.sidebarOpen')).toBe('true');
+    });
+  });
+});
+
+describe('App Component - Git view navigator', () => {
+  const repoStateResponse = {
+    currentBranch: 'feature/auth',
+    headShortHash: 'abc1234',
+    baseBranch: 'origin/main',
+    detectedBaseBranch: 'origin/main',
+    mergeBaseShortHash: 'def5678',
+    commits: [{ hash: 'a'.repeat(40), shortHash: 'aaaaaaa', message: 'Add login form' }],
+    commitsAreFallback: false,
+  };
+
+  const diffRequests = () =>
+    vi
+      .mocked(global.fetch)
+      .mock.calls.map((call) => String(call[0]))
+      .filter((url) => url.startsWith('/api/diff'));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockComments = [];
+    mockConfirm.mockReturnValue(false);
+    mockFetch(mockDiffResponse, undefined, repoStateResponse);
+  });
+
+  it('shows the current branch and the commits on it', async () => {
+    renderApp();
+
+    expect(await screen.findByText('feature/auth')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Add login form/ })).toBeInTheDocument();
+  });
+
+  it('switches to the unstaged view without restarting the CLI', async () => {
+    renderApp();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Unstaged' }));
+
+    await waitFor(() => {
+      expect(
+        diffRequests().some((url) => url.includes('base=staged') && url.includes('target=working')),
+      ).toBe(true);
+    });
+  });
+
+  it('switches to the staged view', async () => {
+    renderApp();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Staged' }));
+
+    await waitFor(() => {
+      expect(
+        diffRequests().some((url) => url.includes('base=HEAD') && url.includes('target=staged')),
+      ).toBe(true);
+    });
+  });
+
+  it('asks for the merge-base diff against the detected base branch', async () => {
+    renderApp();
+
+    fireEvent.click(await screen.findByRole('button', { name: /^vs Base/ }));
+
+    await waitFor(() => {
+      expect(
+        diffRequests().some(
+          (url) =>
+            url.includes('base=origin%2Fmain') &&
+            url.includes('target=HEAD') &&
+            url.includes('baseMode=merge-base'),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it('asks for the final diff including uncommitted work', async () => {
+    renderApp();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Final' }));
+
+    await waitFor(() => {
+      expect(
+        diffRequests().some(
+          (url) =>
+            url.includes('base=origin%2Fmain') &&
+            url.includes('target=.') &&
+            url.includes('baseMode=merge-base'),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it('opens a single commit with the existing diff renderer', async () => {
+    renderApp();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Add login form/ }));
+
+    await waitFor(() => {
+      expect(
+        diffRequests().some(
+          (url) => url.includes('base=aaaaaaa%5E') && url.includes('target=aaaaaaa'),
+        ),
+      ).toBe(true);
     });
   });
 });

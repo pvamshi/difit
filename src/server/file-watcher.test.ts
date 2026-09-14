@@ -238,6 +238,76 @@ describe('FileWatcherService', () => {
     });
   });
 
+  describe('REPO mode filtering', () => {
+    beforeEach(async () => {
+      const mockGit = {
+        checkIgnore: vi.fn().mockRejectedValue(new Error('No ignored files')),
+        revparse: vi.fn().mockResolvedValue('.git'),
+      };
+      vi.mocked(simpleGit).mockReturnValue(mockGit as any);
+
+      await fileWatcher.start(DiffMode.REPO, TEST_REPO_PATH, 50);
+      fileWatcher.addClient(mockResponse);
+    });
+
+    const gitWatcherCallback = () => vi.mocked(subscribe).mock.calls[1][1];
+    const workingTreeCallback = () => vi.mocked(subscribe).mock.calls[0][1];
+    const reloadCalls = () =>
+      vi
+        .mocked(mockResponse.write)
+        .mock.calls.filter((call) => call[0].toString().includes('"type":"reload"'));
+
+    it('watches both the working tree and the git directory', () => {
+      expect(subscribe).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(subscribe).mock.calls[0][0]).toBe(TEST_REPO_PATH);
+      expect(vi.mocked(subscribe).mock.calls[1][0]).toBe(`${TEST_REPO_PATH}/.git`);
+    });
+
+    it('reloads when the index changes (git add)', async () => {
+      await gitWatcherCallback()(null, [
+        { path: `${TEST_REPO_PATH}/.git/index`, type: 'update' },
+      ] as Event[]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(reloadCalls()).toHaveLength(1);
+    });
+
+    it('reloads when a ref changes (commit, reset, branch switch)', async () => {
+      await gitWatcherCallback()(null, [
+        { path: `${TEST_REPO_PATH}/.git/refs/heads/feature`, type: 'update' },
+      ] as Event[]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(reloadCalls()).toHaveLength(1);
+    });
+
+    it('ignores git internals that do not change a diff', async () => {
+      await gitWatcherCallback()(null, [
+        { path: `${TEST_REPO_PATH}/.git/index.lock`, type: 'create' },
+        { path: `${TEST_REPO_PATH}/.git/COMMIT_EDITMSG`, type: 'update' },
+      ] as Event[]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(reloadCalls()).toHaveLength(0);
+    });
+
+    it('applies the same git filtering to events seen by the working tree watcher', async () => {
+      await workingTreeCallback()(null, [
+        { path: `${TEST_REPO_PATH}/.git/COMMIT_EDITMSG`, type: 'update' },
+      ] as Event[]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(reloadCalls()).toHaveLength(0);
+
+      await workingTreeCallback()(null, [
+        { path: `${TEST_REPO_PATH}/src/App.tsx`, type: 'update' },
+      ] as Event[]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(reloadCalls()).toHaveLength(1);
+    });
+  });
+
   describe('debounce functionality', () => {
     beforeEach(async () => {
       const mockGit = {

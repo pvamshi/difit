@@ -86,6 +86,15 @@ vi.mock('./git-diff.js', () => {
       source: 'content',
     });
     clearResolvedCommitCache = vi.fn();
+    getRepoState = vi.fn().mockResolvedValue({
+      currentBranch: 'feature/auth',
+      headShortHash: 'abc1234',
+      baseBranch: 'origin/main',
+      detectedBaseBranch: 'origin/main',
+      mergeBaseShortHash: 'def5678',
+      commits: [{ hash: 'abc1234', shortHash: 'abc1234', message: 'Test commit' }],
+      commitsAreFallback: false,
+    });
     getRevisionOptions = vi.fn().mockResolvedValue({
       branches: [{ name: 'main', current: true }],
       commits: [{ hash: 'abc1234', shortHash: 'abc1234', message: 'Test commit' }],
@@ -1360,6 +1369,47 @@ describe('Server Integration Tests', () => {
       expect(data.originDefaultBranch).toBe('origin/main');
       expect(data.resolvedBase).toBe('abc1234');
       expect(data.resolvedTarget).toBe('def5678');
+    });
+  });
+
+  describe('Repository state API', () => {
+    it('returns the branch, detected base and branch commits', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+      });
+      servers.push(result.server);
+
+      const response = await fetch(`http://localhost:${result.port}/api/repo-state`);
+      const data = (await response.json()) as any;
+
+      expect(response.ok).toBe(true);
+      expect(data.currentBranch).toBe('feature/auth');
+      expect(data.baseBranch).toBe('origin/main');
+      expect(data.commits).toHaveLength(1);
+      expect(parserInstances.at(-1).getRepoState).toHaveBeenCalledWith(undefined);
+    });
+
+    it('passes an explicit base branch through to the git layer', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+      });
+      servers.push(result.server);
+
+      const response = await fetch(`http://localhost:${result.port}/api/repo-state?base=develop`);
+
+      expect(response.ok).toBe(true);
+      expect(parserInstances.at(-1).getRepoState).toHaveBeenCalledWith('develop');
+    });
+
+    it('is unavailable for stdin diffs', async () => {
+      const result = await startServer({
+        stdinDiff: 'diff --git a/a.txt b/a.txt\n',
+      });
+      servers.push(result.server);
+
+      const response = await fetch(`http://localhost:${result.port}/api/repo-state`);
+
+      expect(response.status).toBe(400);
     });
   });
 

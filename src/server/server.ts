@@ -9,7 +9,7 @@ import open from 'open';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { type DiffMode } from '../types/watch.js';
+import { DiffMode } from '../types/watch.js';
 import { formatCommentsOutput } from '../utils/commentFormatting.js';
 import {
   mergeCommentImports,
@@ -56,6 +56,11 @@ interface ServerOptions {
   clearComments?: boolean;
   commentImports?: CommentImport[];
   keepAlive?: boolean;
+  /**
+   * Watch mode the CLI started in. Repository-backed servers now always watch
+   * the whole repository (the UI can switch views at runtime), so this is kept
+   * only to describe the CLI's initial intent.
+   */
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
@@ -63,6 +68,9 @@ interface ServerOptions {
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
 const MAX_DIFF_CACHE_ENTRIES = 8;
+// Collapse the burst of filesystem events a single save or git command produces
+// before invalidating caches and telling the browser to refetch.
+const WATCH_DEBOUNCE_MS = 200;
 
 function createDiffCacheKey(selection: DiffSelection, ignoreWhitespace: boolean) {
   return `${getDiffSelectionKey(selection)}\u0000${ignoreWhitespace ? '1' : '0'}`;
@@ -441,6 +449,23 @@ export async function startServer(
     } catch (error) {
       console.error('Error fetching revisions:', error);
       res.status(500).json({ error: 'Failed to fetch revisions' });
+    }
+  });
+
+  // Live repository state for the git view navigator: current branch, detected
+  // base branch, and the commits this branch adds on top of that base.
+  app.get('/api/repo-state', async (req, res) => {
+    if (options.stdinDiff) {
+      res.status(400).json({ error: 'Repository state is not available for stdin diff' });
+      return;
+    }
+
+    try {
+      const requestedBase = typeof req.query.base === 'string' ? req.query.base : undefined;
+      res.json(await parser.getRepoState(requestedBase));
+    } catch (error) {
+      console.error('Error fetching repository state:', error);
+      res.status(500).json({ error: 'Failed to fetch repository state' });
     }
   });
 
@@ -1060,10 +1085,17 @@ export async function startServer(
     console.warn('   Make sure this is intended and your network is secure.\n');
   }
 
-  // Start file watcher
-  if (options.diffMode) {
+  // Start file watcher.
+  // The browser can switch between unstaged/staged/commit/branch views without
+  // restarting the CLI, so a repository-backed server always watches the whole
+  // repository rather than only what `options.diffMode` asked for at startup.
+  if (!options.stdinDiff) {
     try {
-      await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
+      await fileWatcher.start(DiffMode.REPO, repositoryPath, WATCH_DEBOUNCE_MS, invalidateCache);
+      // Release the native watchers with the HTTP server they belong to.
+      server.on('close', () => {
+        void fileWatcher.stop();
+      });
     } catch (error) {
       console.warn('⚠️  File watcher failed to start:', error);
       console.warn('   Continuing without file watching...');

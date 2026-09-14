@@ -225,6 +225,31 @@ export interface RevisionsResponse {
   resolvedTarget?: string;
 }
 
+export interface RepoCommitInfo extends CommitInfo {
+  author?: string;
+  date?: string;
+}
+
+/**
+ * Live repository state powering the git view navigator (branch, detected base
+ * branch and the commits this branch added on top of that base).
+ */
+export interface RepoStateResponse {
+  currentBranch: string | null;
+  headShortHash: string | null;
+  /** Base branch actually used (an explicit override, or the detected one). */
+  baseBranch: string | null;
+  /** Base branch difit detected on its own, regardless of any override. */
+  detectedBaseBranch: string | null;
+  mergeBaseShortHash: string | null;
+  commits: RepoCommitInfo[];
+  /**
+   * True when `base..HEAD` was empty (e.g. sitting on the base branch) and the
+   * commit list falls back to the most recent commits reachable from HEAD.
+   */
+  commitsAreFallback: boolean;
+}
+
 // Expanded lines types for showing more context in diffs
 export interface ExpandedLinesState {
   [filePath: string]: FileExpandedState;

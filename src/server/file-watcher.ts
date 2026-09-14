@@ -1,4 +1,4 @@
-import { join, resolve } from 'path';
+import { join, resolve, sep } from 'path';
 
 import { type Response } from 'express';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -45,7 +45,27 @@ const MODE_WATCH_CONFIGS: Record<DiffMode, ModeWatchConfig> = {
     watchPaths: [], // No watching for specific commits
     ignore: [],
   },
+  // The web UI can switch between unstaged/staged/commit/branch views without
+  // restarting difit, so this mode watches everything that can change any of
+  // them: working tree files, the index, HEAD, and refs.
+  [DiffMode.REPO]: {
+    watchPaths: ['.', '.git'],
+    ignore: ['.git/objects/**', 'node_modules/**'],
+  },
 };
+
+// Files inside the git directory that change a diff in REPO mode. Everything
+// else there (lock files, COMMIT_EDITMSG, object churn) is ignored so a single
+// git command doesn't fan out into repeated refreshes.
+const REPO_RELEVANT_GIT_FILES = new Set([
+  'HEAD',
+  'index',
+  'ORIG_HEAD',
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'packed-refs',
+]);
 
 export class FileWatcherService {
   private subscriptions: Array<{ unsubscribe: () => Promise<void> }> = [];
@@ -53,6 +73,7 @@ export class FileWatcherService {
   private debounceTimer: NodeJS.Timeout | null = null;
   private config: FileWatcherConfig | null = null;
   private git: SimpleGit | null = null;
+  private gitDirPath: string | null = null;
 
   constructor() {}
 
@@ -92,12 +113,14 @@ export class FileWatcherService {
     // failing at module load time.
     const { subscribe } = await import('@parcel/watcher');
 
+    this.gitDirPath = await this.resolveGitDir(basePath);
+
     for (const watchPath of modeConfig.watchPaths) {
       let fullPath = join(basePath, watchPath);
 
       // Resolve git worktree path for .git directory
       if (watchPath === '.git') {
-        fullPath = await this.resolveGitDir(basePath);
+        fullPath = this.gitDirPath;
       }
 
       try {
@@ -116,18 +139,28 @@ export class FileWatcherService {
                 continue;
               }
 
+              // In REPO mode the working-tree watcher also sees the git
+              // directory, so apply the same relevance filter to those events.
+              if (
+                watchPath === '.' &&
+                this.config?.diffMode === DiffMode.REPO &&
+                this.isInsideGitDir(event.path) &&
+                !this.isRelevantGitPath(event.path, DiffMode.REPO)
+              ) {
+                continue;
+              }
+
               // For working directory watching, also apply .gitignore patterns
               if (watchPath === '.' && (await this.isGitignored(event.path, basePath))) {
                 continue;
               }
 
               // For git directory watching, only care about specific files
-              if (watchPath === '.git') {
-                const fileName = event.path.replace(/.*[/\\]/, '');
-                const isRelevantGitFile = this.isRelevantGitFile(fileName, this.config?.diffMode);
-                if (!isRelevantGitFile) {
-                  continue;
-                }
+              if (
+                watchPath === '.git' &&
+                !this.isRelevantGitPath(event.path, this.config?.diffMode)
+              ) {
+                continue;
               }
 
               relevantEvents.push(event);
@@ -182,6 +215,30 @@ export class FileWatcherService {
     return new RegExp(regex).test(filePath);
   }
 
+  private isInsideGitDir(filePath: string): boolean {
+    if (!this.gitDirPath) {
+      return false;
+    }
+
+    return filePath === this.gitDirPath || filePath.startsWith(`${this.gitDirPath}${sep}`);
+  }
+
+  private isRelevantGitPath(filePath: string, diffMode?: DiffMode): boolean {
+    const fileName = filePath.replace(/.*[/\\]/, '');
+
+    if (diffMode === DiffMode.REPO) {
+      return (
+        REPO_RELEVANT_GIT_FILES.has(fileName) ||
+        // Branch/tag updates (commit, reset, branch switch, fetch) and the
+        // scratch directories git uses during rebase/merge.
+        /[/\\]refs[/\\]/.test(filePath) ||
+        /[/\\]rebase-(merge|apply)[/\\]/.test(filePath)
+      );
+    }
+
+    return this.isRelevantGitFile(fileName, diffMode);
+  }
+
   private isRelevantGitFile(fileName: string, diffMode?: DiffMode): boolean {
     if (!diffMode) return false;
 
@@ -192,6 +249,8 @@ export class FileWatcherService {
       case DiffMode.WORKING:
       case DiffMode.STAGED:
         return fileName === 'index' || fileName === 'HEAD';
+      case DiffMode.REPO:
+        return REPO_RELEVANT_GIT_FILES.has(fileName);
       default:
         return false;
     }
@@ -300,6 +359,7 @@ export class FileWatcherService {
       case DiffMode.STAGED:
         return 'staging'; // .git/index changes
       case DiffMode.WORKING:
+      case DiffMode.REPO:
         return 'file'; // Both file and staging changes, default to file
       default:
         return 'file';

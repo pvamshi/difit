@@ -4,6 +4,7 @@ export enum DiffMode {
   STAGED = 'staged', // HEAD vs staged
   DOT = 'dot', // HEAD vs working (all changes)
   SPECIFIC = 'specific', // commit vs commit (no watching)
+  REPO = 'repo', // whole repository (the web UI can switch views at any time)
 }
 
 type WatchChangeType = 'file' | 'commit' | 'staging';

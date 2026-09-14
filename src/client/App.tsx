@@ -27,6 +27,7 @@ import { DiffQuickMenu } from './components/DiffQuickMenu';
 import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
 import { GitHubIcon } from './components/GitHubIcon';
+import { GitViewNav } from './components/GitViewNav';
 import { HelpModal } from './components/HelpModal';
 import { Logo } from './components/Logo';
 import { ReloadButton } from './components/ReloadButton';
@@ -34,12 +35,14 @@ import { RevisionDetailModal } from './components/RevisionDetailModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SparkleAnimation } from './components/SparkleAnimation';
 import { WordHighlightProvider } from './contexts/WordHighlightContext';
+import { type GitView, gitViewToSelection, matchGitView } from './gitViews';
 import { useAppearanceSettings } from './hooks/useAppearanceSettings';
 import { useDiffComments } from './hooks/useDiffComments';
 import { useExpandedLines, type MergedChunk } from './hooks/useExpandedLines';
 import { useFileWatch } from './hooks/useFileWatch';
 import { useKeyboardNavigation } from './hooks/useKeyboardNavigation';
 import { useLazyDiffRendering } from './hooks/useLazyDiffRendering';
+import { useRepoState } from './hooks/useRepoState';
 import { useViewedFiles } from './hooks/useViewedFiles';
 import { useViewport } from './hooks/useViewport';
 import { fetchClientSettings, saveClientSettings } from './services/userSettings';
@@ -56,6 +59,7 @@ import {
 import { buildFileLineIndex, isThreadOutdated } from './utils/outdatedComments';
 
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
+const EMPTY_BRANCHES: RevisionsResponse['branches'] = [];
 const EMPTY_MERGED_CHUNKS: MergedChunk[] = [];
 const DIFF_VIEW_MODE_STORAGE_KEY = 'difit.diffViewMode';
 const SIDEBAR_WIDTH_STORAGE_KEY = 'difit.sidebarWidth';
@@ -153,6 +157,12 @@ function App() {
   );
   const [resolvedBaseRevision, setResolvedBaseRevision] = useState<string>('');
   const [resolvedTargetRevision, setResolvedTargetRevision] = useState<string>('');
+
+  // Git view navigator state (see gitViews.ts). The active view is derived from
+  // the current selection so the navigator, the revision selector and the CLI's
+  // initial arguments can never disagree.
+  const [baseBranchOverride, setBaseBranchOverride] = useState<string | null>(null);
+  const { repoState, refreshRepoState } = useRepoState(baseBranchOverride);
   const hasUserSelectedRevisionRef = useRef(false);
   const currentRequestedBaseModeRef = useRef(selectedRevision.baseMode);
   currentRequestedBaseModeRef.current = diffData?.requestedBaseMode ?? selectedRevision.baseMode;
@@ -575,6 +585,17 @@ function App() {
     handleCommentsChanged,
   );
 
+  // Apply repository changes without a page reload: refetch the active diff and
+  // the branch/commit list in place, keeping the rest of the UI state intact.
+  useEffect(() => {
+    if (!shouldReload || watchState.isReloading) {
+      return;
+    }
+
+    reload();
+    void refreshRepoState();
+  }, [refreshRepoState, reload, shouldReload, watchState.isReloading]);
+
   // Track which file the mouse is over so `v` works without a cursor
   const hoveredFileIndexRef = useRef<number | null>(null);
   const getHoveredFileIndex = useCallback(() => hoveredFileIndexRef.current, []);
@@ -873,18 +894,42 @@ function App() {
 
   // Handle revision change
   const handleRevisionChange = useCallback(
-    async (nextSelection: DiffSelection) => {
+    async (
+      nextSelection: DiffSelection,
+      { showLoading = true }: { showLoading?: boolean } = {},
+    ) => {
       // Skip if no actual change
       if (diffSelectionsEqual(nextSelection, selectedRevision)) return;
 
       hasUserSelectedRevisionRef.current = true;
       selectedRevisionRef.current = nextSelection;
       setSelectedRevision(nextSelection);
-      setLoading(true);
+      if (showLoading) {
+        setLoading(true);
+      }
       setError(null);
       await fetchDiffData(nextSelection);
     },
     [fetchDiffData, selectedRevision],
+  );
+
+  const activeGitView = useMemo(
+    () =>
+      matchGitView(selectedRevision, {
+        baseBranch: repoState?.baseBranch ?? null,
+        commits: repoState?.commits ?? [],
+        resolvedTargetCommitish: resolvedTargetRevision,
+      }),
+    [repoState, resolvedTargetRevision, selectedRevision],
+  );
+
+  // Switching views keeps the current diff on screen until the new one arrives,
+  // so the sidebar, scroll position and settings survive the swap.
+  const handleSelectGitView = useCallback(
+    (view: GitView) => {
+      void handleRevisionChange(gitViewToSelection(view), { showLoading: false });
+    },
+    [handleRevisionChange],
   );
 
   // Clear comments and viewed files on initial load if requested via CLI flag
@@ -1317,7 +1362,7 @@ function App() {
               )}
               <div className="flex flex-col gap-1 items-center">
                 <div className="text-xs relative">
-                  {viewedFiles.size === diffData.files.length
+                  {diffData.files.length > 0 && viewedFiles.size === diffData.files.length
                     ? 'All diffs difit-ed!'
                     : `${viewedFiles.size} / ${diffData.files.length} files viewed`}
                   <SparkleAnimation isActive={showSparkles} />
@@ -1332,11 +1377,13 @@ function App() {
                   <div
                     className="absolute top-0 right-0 h-full transition-all duration-300 ease-out"
                     style={{
-                      width: `${((diffData.files.length - viewedFiles.size) / diffData.files.length) * 100}%`,
+                      width: `${diffData.files.length > 0 ? ((diffData.files.length - viewedFiles.size) / diffData.files.length) * 100 : 0}%`,
                       backgroundColor: (() => {
                         const remainingPercent =
-                          ((diffData.files.length - viewedFiles.size) / diffData.files.length) *
-                          100;
+                          diffData.files.length > 0
+                            ? ((diffData.files.length - viewedFiles.size) / diffData.files.length) *
+                              100
+                            : 0;
                         if (remainingPercent > 50) return 'var(--color-github-accent)'; // green
                         if (remainingPercent > 20) return 'var(--color-github-warning)'; // yellow
                         return 'var(--color-github-danger)'; // red
@@ -1423,6 +1470,14 @@ function App() {
                   : undefined,
               }}
             >
+              <GitViewNav
+                activeView={activeGitView}
+                repoState={repoState}
+                branches={revisionOptions?.branches ?? EMPTY_BRANCHES}
+                baseBranchOverride={baseBranchOverride}
+                onSelectView={handleSelectGitView}
+                onChangeBaseBranch={setBaseBranchOverride}
+              />
               <div className="flex-1 overflow-y-auto">
                 <FileList
                   files={diffData.files}
@@ -1475,6 +1530,13 @@ function App() {
             ref={diffScrollContainerRef}
             className={`flex-1 overflow-y-auto ${showMobileCommentsBar ? 'pb-16' : ''}`}
           >
+            {diffData.files.length === 0 && (
+              <div className="flex h-full items-center justify-center p-8 text-center">
+                <p className="text-sm text-github-text-secondary">
+                  No changes in this view ({diffData.commit}).
+                </p>
+              </div>
+            )}
             {diffData.files.map((file, fileIndex) => {
               const fileThreads = threadsByFile.get(file.path) ?? EMPTY_COMMENT_THREADS;
               const mergedChunks =

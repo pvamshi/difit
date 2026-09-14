@@ -22,8 +22,24 @@ Object.defineProperty(window, 'getComputedStyle', {
 });
 
 // Global test utilities
-export const mockFetch = (response: any, revisionsResponse?: any) => {
+export const mockFetch = (response: any, revisionsResponse?: any, repoStateResponse?: any) => {
   (global.fetch as any).mockImplementation((url: string) => {
+    // Handle /api/repo-state endpoint (git view navigator)
+    if (url.includes('/api/repo-state')) {
+      return Promise.resolve({
+        ok: repoStateResponse !== null,
+        json: async () =>
+          repoStateResponse ?? {
+            currentBranch: null,
+            headShortHash: null,
+            baseBranch: null,
+            detectedBaseBranch: null,
+            mergeBaseShortHash: null,
+            commits: [],
+            commitsAreFallback: false,
+          },
+      });
+    }
     // Handle /api/revisions endpoint
     if (url.includes('/api/revisions')) {
       return Promise.resolve({

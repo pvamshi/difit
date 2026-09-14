@@ -8,6 +8,8 @@ import {
   type DiffLine,
   type DiffResponse,
   type DiffSelection,
+  type RepoCommitInfo,
+  type RepoStateResponse,
 } from '../types/diff.js';
 import { getMergeBaseTargetRef, normalizeBaseMode } from '../utils/diffSelection.js';
 
@@ -797,6 +799,116 @@ export class GitDiffParser {
     }
 
     return null;
+  }
+
+  /**
+   * Branch currently checked out, or null when HEAD is detached.
+   */
+  async getCurrentBranch(): Promise<string | null> {
+    try {
+      const branch = await this.git.raw(['rev-parse', '--abbrev-ref', 'HEAD']);
+      const trimmed = branch.trim();
+      return trimmed.length > 0 && trimmed !== 'HEAD' ? trimmed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Base branch for the "vs Base" / "Final" views. Prefers the remote default
+   * branch (origin/main, origin/master, ...) and falls back to a local default
+   * branch, reusing the existing detection helpers instead of hardcoding names.
+   */
+  async getBaseBranch(): Promise<string | null> {
+    const originDefaultBranch = await this.getOriginDefaultBranch();
+    if (originDefaultBranch) {
+      return originDefaultBranch;
+    }
+
+    try {
+      return await this.getDefaultBranch();
+    } catch {
+      return null;
+    }
+  }
+
+  async getMergeBase(baseCommitish: string, targetCommitish = 'HEAD'): Promise<string | null> {
+    try {
+      const mergeBase = await this.git.raw([
+        'merge-base',
+        getMergeBaseTargetRef(targetCommitish),
+        baseCommitish,
+      ]);
+      return mergeBase.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseCommitLog(output: string): RepoCommitInfo[] {
+    return output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const [hash, message, author, date] = line.split('\u001f');
+        return {
+          hash,
+          shortHash: hash.substring(0, 7),
+          message: message ?? '',
+          author: author || undefined,
+          date: date || undefined,
+        };
+      })
+      .filter((commit) => commit.hash.length > 0);
+  }
+
+  /**
+   * Commits in a revision range (e.g. `origin/main..HEAD`), newest first.
+   * Returns an empty list for unknown refs rather than throwing.
+   */
+  async getCommitRange(range: string, maxCount = 100): Promise<RepoCommitInfo[]> {
+    try {
+      const output = await this.git.raw([
+        'log',
+        `--max-count=${maxCount}`,
+        '--format=%H%x1f%s%x1f%an%x1f%aI',
+        range,
+        '--',
+      ]);
+      return typeof output === 'string' ? this.parseCommitLog(output) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async getRepoState(requestedBaseBranch?: string): Promise<RepoStateResponse> {
+    const [currentBranch, detectedBaseBranch, headShortHash] = await Promise.all([
+      this.getCurrentBranch(),
+      this.getBaseBranch(),
+      this.resolveCommitish('HEAD').catch(() => null),
+    ]);
+
+    const requested = requestedBaseBranch?.trim();
+    const baseBranch = requested && requested.length > 0 ? requested : detectedBaseBranch;
+    const mergeBase = baseBranch ? await this.getMergeBase(baseBranch) : null;
+
+    let commits = baseBranch ? await this.getCommitRange(`${baseBranch}..HEAD`) : [];
+    let commitsAreFallback = false;
+    if (commits.length === 0) {
+      commits = await this.getCommitRange('HEAD', 20);
+      commitsAreFallback = commits.length > 0;
+    }
+
+    return {
+      currentBranch,
+      headShortHash,
+      baseBranch,
+      detectedBaseBranch,
+      mergeBaseShortHash: mergeBase ? mergeBase.substring(0, 7) : null,
+      commits,
+      commitsAreFallback,
+    };
   }
 
   async getRevisionOptions(
