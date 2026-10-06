@@ -1652,12 +1652,25 @@ describe('Server Integration Tests', () => {
       // Disconnect by aborting
       controller.abort();
 
-      // Wait for the server's close handler + setTimeout(100ms) to run
+      // Wait for the server's close handler to run
       await new Promise((resolve) => setTimeout(resolve, 300));
 
       // With keepAlive, process.exit should NOT have been called
       expect(process.exit).not.toHaveBeenCalled();
     });
+
+    // Opens a heartbeat stream and waits for the initial "connected" message.
+    async function connectHeartbeat(port: number): Promise<AbortController> {
+      const controller = new AbortController();
+      const response = await fetch(`http://localhost:${port}/api/heartbeat`, {
+        signal: controller.signal,
+      }).catch(() => null);
+      await response?.body?.getReader().read();
+      return controller;
+    }
+
+    // Longer than the server's reconnect grace period.
+    const waitPastShutdownGrace = () => new Promise((resolve) => setTimeout(resolve, 3_300));
 
     it('calls process.exit on client disconnect when keepAlive is false', async () => {
       const { port, server } = await startServer({
@@ -1667,30 +1680,56 @@ describe('Server Integration Tests', () => {
       });
       servers.push(server);
 
-      // Connect to heartbeat SSE endpoint and then abort
-      const controller = new AbortController();
-      const responsePromise = fetch(`http://localhost:${port}/api/heartbeat`, {
-        signal: controller.signal,
-      });
+      const heartbeat = await connectHeartbeat(port);
+      heartbeat.abort();
 
-      // Wait for the connection to be established
-      const response = await responsePromise.catch(() => null);
-      if (response) {
-        const reader = response.body?.getReader();
-        if (reader) {
-          await reader.read(); // Read the initial "connected" message
-        }
-      }
-
-      // Disconnect by aborting
-      controller.abort();
-
-      // Wait for the server's close handler + setTimeout(100ms) to run
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await waitPastShutdownGrace();
 
       // Without keepAlive, process.exit SHOULD have been called
       expect(process.exit).toHaveBeenCalledWith(0);
-    });
+    }, 10_000);
+
+    it('keeps running when the page reloads and reconnects within the grace period', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        keepAlive: false,
+        preferredPort: 9085,
+      });
+      servers.push(server);
+
+      const beforeReload = await connectHeartbeat(port);
+      beforeReload.abort();
+      const afterReload = await connectHeartbeat(port);
+
+      try {
+        await waitPastShutdownGrace();
+
+        expect(process.exit).not.toHaveBeenCalled();
+      } finally {
+        afterReload.abort();
+      }
+    }, 10_000);
+
+    it('keeps running while another tab is still connected', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        keepAlive: false,
+        preferredPort: 9090,
+      });
+      servers.push(server);
+
+      const firstTab = await connectHeartbeat(port);
+      const secondTab = await connectHeartbeat(port);
+      firstTab.abort();
+
+      try {
+        await waitPastShutdownGrace();
+
+        expect(process.exit).not.toHaveBeenCalled();
+      } finally {
+        secondTab.abort();
+      }
+    }, 10_000);
   });
 
   describe('Clear Comments functionality', () => {

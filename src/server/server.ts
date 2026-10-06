@@ -71,6 +71,9 @@ const MAX_DIFF_CACHE_ENTRIES = 8;
 // Collapse the burst of filesystem events a single save or git command produces
 // before invalidating caches and telling the browser to refetch.
 const WATCH_DEBOUNCE_MS = 200;
+// How long the server waits after the last browser tab disconnects before
+// shutting down; long enough for a page reload to reconnect.
+const HEARTBEAT_RECONNECT_GRACE_MS = 3_000;
 
 function createDiffCacheKey(selection: DiffSelection, ignoreWhitespace: boolean) {
   return `${getDiffSelectionKey(selection)}\u0000${ignoreWhitespace ? '1' : '0'}`;
@@ -1006,7 +1009,13 @@ export async function startServer(
     });
   });
 
-  // SSE endpoint to detect when tab is closed
+  // SSE endpoint to detect when tab is closed.
+  // Shutdown waits for every tab to be gone for a short grace period, so a page
+  // reload (which drops and re-opens the heartbeat) or a second tab closing
+  // doesn't stop the server the other tab is still using.
+  let activeHeartbeatClients = 0;
+  let shutdownTimer: NodeJS.Timeout | null = null;
+
   app.get('/api/heartbeat', (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -1014,6 +1023,12 @@ export async function startServer(
       Connection: 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
+
+    activeHeartbeatClients += 1;
+    if (shutdownTimer) {
+      clearTimeout(shutdownTimer);
+      shutdownTimer = null;
+    }
 
     // Send initial heartbeat
     res.write('data: connected\n\n');
@@ -1026,12 +1041,18 @@ export async function startServer(
     // When client disconnects (tab closed, navigation, etc.)
     req.on('close', () => {
       clearInterval(heartbeatInterval);
+      activeHeartbeatClients -= 1;
       if (options.keepAlive) {
         console.log('Client disconnected, but server is staying alive (--keep-alive)');
         console.log('Press Ctrl+C to stop the server');
-      } else {
-        // Add a small delay to ensure any pending sendBeacon requests are processed
-        setTimeout(async () => {
+      } else if (activeHeartbeatClients === 0) {
+        // The grace period also lets pending sendBeacon requests be processed
+        shutdownTimer = setTimeout(async () => {
+          // A tab reconnected, or the server was closed deliberately meanwhile.
+          if (activeHeartbeatClients > 0 || !server.listening) {
+            return;
+          }
+
           console.log('Client disconnected, shutting down server...');
 
           // Stop file watcher
@@ -1039,7 +1060,7 @@ export async function startServer(
 
           outputFinalComments();
           process.exit(0);
-        }, 100);
+        }, HEARTBEAT_RECONNECT_GRACE_MS);
       }
     });
   });
